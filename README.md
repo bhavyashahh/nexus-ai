@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/bhavyashahh/nexus-ai?style=plastic)](https://img.shields.io/github/stars/bhavyashahh/nexus-ai)
 [![GitHub watchers](https://img.shields.io/github/watchers/bhavyashahh/nexus-ai?style=plastic&label=Watch)](https://github.com/bhavyashahh/nexus-ai)
 
-![Nexus Banner](nexus-ai.jpeg)
+<img src="nexus-ai.jpeg" width="350" height="300" alt="Nexus Banner">
 
 
 ## The Convergence of Ideas, Passion, and Possibilities 🧠
