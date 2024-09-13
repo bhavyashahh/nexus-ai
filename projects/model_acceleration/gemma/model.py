@@ -23,6 +23,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 from gemma import config as gemma_config
 from gemma import tokenizer
+from flash_attention_utils import is_flash_attn_greater_or_equal_2_10, _flash_attention_forward, is_flash_attn_greater_or_equal
 
 
 class Sampler(nn.Module):
@@ -331,23 +332,121 @@ class GemmaAttention(nn.Module):
         return output
 
 
+class Gemma2FlashAttention2(GemmaAttention):
+    """
+    Gemma2 flash attention module. This module inherits from `Gemma2Attention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+    flash attention and deal with padding tokens in case the input contains any of them.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: torch.Tensor,
+        kv_write_indices: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+    ):
+
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                               dim=-1)
+
+        # Flash attention requires the input to have the shape
+        # batch_size x seq_length x head_dim x hidden_dim
+        # therefore we just need to keep the original shape
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # cos, sin = self.rotary_emb(value_states, position_ids)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Positional embedding.
+        query_states = apply_rotary_emb(query_states, freqs_cis=freqs_cis)
+        key_states = apply_rotary_emb(key_states, freqs_cis=freqs_cis)
+
+        # Write new kv cache.
+        # [batch_size, input_len, n_local_kv_heads, head_dim]
+        k_cache, v_cache = kv_cache
+        k_cache.index_copy_(1, kv_write_indices, key_states)
+        v_cache.index_copy_(1, kv_write_indices, value_states)
+
+
+
+        if mask is not None:
+            seq_len = mask.shape[1]
+            key_states = key_states[:, :, :seq_len]
+            value_states = value_states[:, :, :seq_len]
+
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # to be able to avoid many of these transpose/reshape/view.
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        input_dtype = query_states.dtype
+        target_dtype = self.qkv_proj.weight.dtype
+        
+        query_states = query_states.to(target_dtype)
+        key_states = key_states.to(target_dtype)
+        value_states = value_states.to(target_dtype)
+
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            mask,
+            q_len,
+            dropout=0.0,
+            softmax_scale=self.scaling,
+            is_causal=self.is_causal,
+            sliding_window=self.sliding_window_size,
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+            softcap=self.attn_logit_softcapping if is_flash_attn_greater_or_equal("2.6.0") else None,
+        )
+
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+
+        return attn_output
+
+
+
+
+
 class GemmaDecoderLayer(nn.Module):
 
     def __init__(
         self,
         config: gemma_config.GemmaConfig,
+        flash_attn=False,
     ):
         super().__init__()
-        self.self_attn = GemmaAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            attn_logit_softcapping=config.attn_logit_softcapping,
-            query_pre_attn_scalar=config.query_pre_attn_scalar,
-            head_dim=config.head_dim,
-            quant=config.quant,
-            attn_type=gemma_config.AttentionType.GLOBAL,
-        )
+        if flash_attn:
+            self.self_attn = Gemma2FlashAttention2()
+
+        else:
+            self.self_attn = GemmaAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                attn_logit_softcapping=config.attn_logit_softcapping,
+                query_pre_attn_scalar=config.query_pre_attn_scalar,
+                head_dim=config.head_dim,
+                quant=config.quant,
+                attn_type=gemma_config.AttentionType.GLOBAL,
+            )
         self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -460,7 +559,7 @@ class Gemma2DecoderLayer(nn.Module):
 
 class GemmaModel(nn.Module):
 
-    def __init__(self, config: gemma_config.GemmaConfig):
+    def __init__(self, config: gemma_config.GemmaConfig, flash_attn=False):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -468,7 +567,7 @@ class GemmaModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
             if config.architecture == gemma_config.Architecture.GEMMA_1:
-                self.layers.append(GemmaDecoderLayer(config))
+                self.layers.append(GemmaDecoderLayer(config, flash_attn))
             elif config.architecture == gemma_config.Architecture.GEMMA_2:
                 attn_type = (
                     config.attn_types[i]
@@ -517,7 +616,7 @@ class GemmaForCausalLM(nn.Module):
 
         self.tokenizer = tokenizer.Tokenizer(config.tokenizer)
         self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
-        self.model = GemmaModel(config)
+        self.model = GemmaModel(config, flash_attn=False)
         self.sampler = Sampler(vocab_size, config)
 
         # Pre-compute rotary embedding table.
